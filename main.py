@@ -4,9 +4,15 @@
 
 # You will need chrome installed and the correct chromedriver for it for this to work (read GitHub page for more)
 # To improve reliability, please install buster (read GitHub page for more)
+from collections import OrderedDict
+from seleniumwire import webdriver
 from selenium_stealth import stealth
-import undetected_chromedriver as uc
+import undetected_chromedriver.v2 as uc
+
+from driver_options import DriverOptions
+from request_interceptor import interceptor
 import time
+from selenium.webdriver.common.by import By
 from datetime import datetime, timedelta
 from datetime import time as time1
 import requests
@@ -18,6 +24,7 @@ import random
 ##########################################
 # Please update to match your prefrences #
 ##########################################
+from recaptcha import resolve
 
 current_path = str(
     os.path.dirname(os.path.realpath(__file__))
@@ -56,7 +63,7 @@ prefrences = """[
 ]"""
 
 busterEnabled = True
-busterPath = str(current_path) + "/buster-chrome.zip"
+busterPath = str(current_path) + "/buster-chrome.crx"
 chromedriverPath = str(current_path) + "/chromedriver.exe"
 
 
@@ -94,7 +101,7 @@ def is_time_between(begin_time, end_time, check_time=None):
 
 
 def input_text_box(box_id, text, currentDriver):
-    box = currentDriver.find_element_by_id(box_id)
+    box = currentDriver.find_element(By.ID, box_id)
     for charachter in text:
         box.send_keys(charachter)
         time.sleep(random.randint(1, 5) / 100)
@@ -175,49 +182,6 @@ def scan_for_preferred_tests(
     return found, last_date, last_date_element
 
 
-def solve_captcha(currentDriver):
-    driver = currentDriver
-    driver.switch_to.default_content()
-    iframe = driver.find_element_by_id("main-iframe")
-    driver.switch_to.frame(iframe)
-    iframe1 = driver.find_element_by_css_selector(
-        "iframe[name*='a-'][src*='https://www.google.com/recaptcha/api2/anchor?']"
-    )
-    driver.switch_to.frame(iframe1)
-    time.sleep(0.2)
-    driver.find_element_by_xpath("//span[@id='recaptcha-anchor']").click()
-    driver.switch_to.default_content()
-    time.sleep(0.2)
-    iframe = driver.find_element_by_id("main-iframe")
-    driver.switch_to.frame(iframe)
-    if "Why am I seeing this page" in driver.page_source:
-        print("Completing captcha 1")
-        time.sleep(0.2)
-        iframe1 = driver.find_element_by_css_selector(
-            "iframe[title*='recaptcha challenge'][src*='https://www.google.com/recaptcha/api2/bframe?']"
-        )
-        driver.switch_to.frame(iframe1)
-        print("Completing captcha 2")
-        time.sleep(0.2)
-        driver.find_elements_by_class_name("help-button-holder")[0].click()
-        random_sleep(5, 4)
-        attempts2 = 0
-        while (
-            "Multiple correct solutions required" in driver.page_source
-            and attempts2 < 4
-        ):
-            attempts2 += 1
-            driver.find_elements_by_class_name("help-button-holder")[0].click()
-            random_sleep(5, 4)
-        driver.switch_to.default_content()
-        print("Completing captcha 3")
-        time.sleep(0.5)
-    if "Why am I seeing this page" in driver.page_source:
-        return False
-    else:
-        return True
-
-
 def send_update_log(licenceIdUpdate):
     # For future use
     print()
@@ -226,6 +190,7 @@ def send_update_log(licenceIdUpdate):
 def bot_online():
     # For future use
     print()
+
 
 # Send test error to server
 report_error(0)
@@ -239,14 +204,10 @@ activeDrivers = {}  # Dictionary of "licence-id"->driver
 allDriversQuit = True
 maxLoop = 100
 
-# Chrome configuration
-chrome_options = uc.ChromeOptions()
-chrome_options.add_argument("start-maximized")
+patcher = uc.Patcher()
+patcher.auto()
 
-chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
-chrome_options.add_experimental_option('useAutomationExtension', False)
-if busterEnabled:
-    chrome_options.add_extension(busterPath)  # Use reCAPTCHA buster extension
+resolved_captcha = False
 
 #### Main Loop ####
 while runningLoop:
@@ -344,19 +305,31 @@ while runningLoop:
                         + str(licenceInfo["licence-id"])
                     )
 
-                    activeDrivers[licenceInfo["licence-id"]] = uc.Chrome(
-                        use_subprocess=True, options=chrome_options
+                    options = DriverOptions(buster_enabled=busterEnabled)
+                    activeDrivers[licenceInfo["licence-id"]] = webdriver.Chrome(
+                        options=options,
+                        executable_path=patcher.executable_path,
                     )
                     driver = activeDrivers[licenceInfo["licence-id"]]
+                    driver.request_interceptor = interceptor
+
+                    driver.execute_cdp_cmd("Page.setBypassCSP", {"enabled": True})
 
                     stealth(
                         driver,
-                        languages=["en-GB", "en"],
+                        user_agent=options.user_agent,
+                        languages=[options.language],
                         vendor="Google Inc.",
                         platform="Win32",
                         webgl_vendor="Intel Inc.",
                         renderer="Intel Iris OpenGL Engine",
                         fix_hairline=True,
+                    )
+
+                    _extraHTTPHeaders = OrderedDict()
+                    _extraHTTPHeaders["accept-language"] = options.language
+                    driver.execute_cdp_cmd(
+                        "Network.setExtraHTTPHeaders", {"headers": _extraHTTPHeaders}
                     )
 
                     print("Launching queue")
@@ -387,30 +360,14 @@ while runningLoop:
                             "Request unsuccessful. Incapsula incident ID"
                             in driver.page_source
                         ):
-                            random_sleep(5, 10)
-                            driver.refresh()
-                            if (
-                                "Request unsuccessful. Incapsula incident ID"
-                                in driver.page_source
-                            ):
-                                random_sleep(2, 5)
-                                solve_captcha(driver)
-                                time.sleep(4)
-                                if (
-                                    "Request unsuccessful. Incapsula incident ID"
-                                    in driver.page_source
-                                ):
-                                    queueComplete = False
-                                    print("Firewall - Extra delay")
-                                    random_sleep(100, 10)
-                                else:
-                                    print("Firewall has been delt with ;)")
+                            if resolve(driver):
+                                resolved_captcha = True
                             else:
-                                print("Firewall has been delt with ;)")
+                                break
 
                         if queueComplete:
                             random_sleep(1, 1)
-                            driver.find_element_by_id("driving-licence-number").click()
+                            driver.find_element(By.ID, "driving-licence-number").click()
                             random_sleep(1, 1)
                             input_text_box(
                                 "driving-licence-number",
@@ -418,8 +375,8 @@ while runningLoop:
                                 driver,
                             )
                             random_sleep(1, 1)
-                            driver.find_element_by_id(
-                                "application-reference-number"
+                            driver.find_element(
+                                By.ID, "application-reference-number"
                             ).click()
                             random_sleep(1, 1)
                             input_text_box(
@@ -428,7 +385,7 @@ while runningLoop:
                                 driver,
                             )
                             random_sleep(10, 10)
-                            driver.find_element_by_id("booking-login").click()
+                            driver.find_element(By.ID, "booking-login").click()
                             random_sleep(10, 1)
 
                             if "loginError=true" in driver.current_url:
@@ -436,8 +393,8 @@ while runningLoop:
                             else:
                                 random_sleep(3, 1)
 
-                                contents_container = driver.find_elements_by_class_name(
-                                    "contents"
+                                contents_container = driver.find_elements(
+                                    By.CLASS_NAME, "contents"
                                 )
                                 test_date_temp = (
                                     contents_container[0]
@@ -452,8 +409,8 @@ while runningLoop:
                                 print("Test Date: " + test_date_temp)
                                 print("Test Center: " + test_center_temp)
 
-                                if "Your booking has been cancelled. You’ll need to either re-book your test or call the " in driver.find_element_by_id(
-                                    "main"
+                                if "Your booking has been cancelled. You’ll need to either re-book your test or call the " in driver.find_element(
+                                    By.ID, "main"
                                 ).get_attribute(
                                     "innerHTML"
                                 ):
@@ -467,8 +424,8 @@ while runningLoop:
                                         }
                                     )
 
-                                if "The number of allowed changes to your booking has now been exceeded" in driver.find_element_by_id(
-                                    "main"
+                                if "The number of allowed changes to your booking has now been exceeded" in driver.find_element(
+                                    By.ID, "main"
                                 ).get_attribute(
                                     "innerHTML"
                                 ):
@@ -478,13 +435,13 @@ while runningLoop:
 
                                 if "Yes" in licenceInfo["current-test"]["date"]:
                                     print("Reserved test login")
-                                    driver.find_element_by_id(
-                                        "date-time-change"
+                                    driver.find_element(
+                                        By.ID, "date-time-change"
                                     ).click()
                                     random_sleep(1, 2)
 
-                                    driver.find_element_by_id(
-                                        "test-choice-earliest"
+                                    driver.find_element(
+                                        By.ID, "test-choice-earliest"
                                     ).click()
 
                                     random_sleep(1, 2)
@@ -495,21 +452,21 @@ while runningLoop:
 
                                     random_sleep(1, 2)
 
-                                    driver.find_element_by_id(
-                                        "driving-licence-submit"
+                                    driver.find_element(
+                                        By.ID, "driving-licence-submit"
                                     ).click()
 
                                     licenceInfo["centre"] = [test_center_temp]
 
                                     random_sleep(1, 2)
                                 else:
-                                    driver.find_element_by_id(
-                                        "test-centre-change"
+                                    driver.find_element(
+                                        By.ID, "test-centre-change"
                                     ).click()
                                     random_sleep(3, 2)
 
-                                    driver.find_element_by_id(
-                                        "test-centres-input"
+                                    driver.find_element(
+                                        By.ID, "test-centres-input"
                                     ).clear()
                                     input_text_box(
                                         "test-centres-input",
@@ -517,8 +474,8 @@ while runningLoop:
                                         driver,
                                     )
 
-                                    driver.find_element_by_id(
-                                        "test-centres-submit"
+                                    driver.find_element(
+                                        By.ID, "test-centres-submit"
                                     ).click()
                                     random_sleep(5, 2)
 
@@ -609,8 +566,8 @@ while runningLoop:
                                         print("REVERSE NUM: " + str(attempts))
                                         # time.sleep(0.6)
                                         last_date_element.click()
-                                        time_container = driver.find_element_by_id(
-                                            "date-" + last_date
+                                        time_container = driver.find_element(
+                                            By.ID, "date-" + last_date
                                         )
                                         time_item = (
                                             int(
@@ -627,10 +584,11 @@ while runningLoop:
                                         ).strftime("%H:%M")
 
                                         try:
-                                            shortNoticeCheck = time_container.find_element_by_id(
+                                            shortNoticeCheck = time_container.find_element(
+                                                By.ID,
                                                 time_container.find_element_by_xpath(
                                                     ".//label"
-                                                ).get_attribute("for")
+                                                ).get_attribute("for"),
                                             ).get_attribute(
                                                 "data-short-notice"
                                             )
@@ -661,8 +619,8 @@ while runningLoop:
                                             time_container.click()
                                             errorPoint = "p1"
                                             time.sleep(0.1)
-                                            driver.find_element_by_id(
-                                                "slot-chosen-submit"
+                                            driver.find_element(
+                                                By.ID, "slot-chosen-submit"
                                             ).click()
                                             errorPoint = "p2"
                                             time.sleep(0.4)
@@ -671,8 +629,8 @@ while runningLoop:
                                                     "(//button[@id='slot-warning-continue'])[2]"
                                                 ).click()
                                             else:
-                                                driver.find_element_by_id(
-                                                    "slot-warning-continue"
+                                                driver.find_element(
+                                                    By.ID, "slot-warning-continue"
                                                 ).click()
                                             errorPoint = "p3"
                                             random_sleep(1, 1)
@@ -690,16 +648,14 @@ while runningLoop:
                                                 )
                                                 try:
                                                     if not iAmCandidateClicked:
-                                                        driver.find_element_by_id(
-                                                            "i-am-candidate"
+                                                        driver.find_element(
+                                                            By.ID, "i-am-candidate"
                                                         ).click()
                                                         iAmCandidateClicked = True
                                                     try:
                                                         driver.switch_to.default_content()
-                                                        iframe = (
-                                                            driver.find_element_by_id(
-                                                                "main-iframe"
-                                                            )
+                                                        iframe = driver.find_element(
+                                                            By.ID, "main-iframe"
                                                         )
                                                         driver.switch_to.frame(iframe)
                                                         print(
@@ -743,8 +699,10 @@ while runningLoop:
                                                         print("Failed recaptcha")
                                                     if not testTaken:
                                                         try:
-                                                            iframe = driver.find_element_by_id(
-                                                                "main-iframe"
+                                                            iframe = (
+                                                                driver.find_element(
+                                                                    By.ID, "main-iframe"
+                                                                )
                                                             )
                                                             driver.switch_to.frame(
                                                                 iframe
@@ -855,8 +813,8 @@ while runningLoop:
                                             if test_accept:
                                                 print("Booking Test...")
 
-                                                driver.find_element_by_id(
-                                                    "confirm-changes"
+                                                driver.find_element(
+                                                    By.ID, "confirm-changes"
                                                 ).click()
                                                 if (
                                                     "Request unsuccessful. Incapsula incident ID"
@@ -947,6 +905,9 @@ while runningLoop:
 
                         err = True
 
+            if not resolved_captcha:
+                continue
+
             # Continue to check licences
             print("Checking licences")
             for licenceInfo in currentLicences:
@@ -973,16 +934,16 @@ while runningLoop:
 
                             search_centre = licenceInfo["center"][search_centre_id]
 
-                            driver.find_element_by_id("change-test-centre").click()
+                            driver.find_element(By.ID, "change-test-centre").click()
                             moveBack = 1
                             random_sleep(2, 2)
 
-                            driver.find_element_by_id("test-centres-input").clear()
+                            driver.find_element(By.ID, "test-centres-input").clear()
                             input_text_box(
                                 "test-centres-input", str(search_centre), driver
                             )
 
-                            driver.find_element_by_id("test-centres-submit").click()
+                            driver.find_element(By.ID, "test-centres-submit").click()
                             moveBack = 2
                             random_sleep(5, 2)
 
@@ -1104,8 +1065,8 @@ while runningLoop:
                                 print("REVERSE NUM: " + str(attempts))
                                 # time.sleep(0.6)
                                 last_date_element.click()
-                                time_container = driver.find_element_by_id(
-                                    "date-" + last_date
+                                time_container = driver.find_element(
+                                    By.ID, "date-" + last_date
                                 )
                                 time_item = (
                                     int(
@@ -1120,13 +1081,12 @@ while runningLoop:
                                 )
 
                                 try:
-                                    shortNoticeCheck = (
-                                        time_container.find_element_by_id(
-                                            time_container.find_element_by_xpath(
-                                                ".//label"
-                                            ).get_attribute("for")
-                                        ).get_attribute("data-short-notice")
-                                    )
+                                    shortNoticeCheck = time_container.find_element(
+                                        By.ID,
+                                        time_container.find_element_by_xpath(
+                                            ".//label"
+                                        ).get_attribute("for"),
+                                    ).get_attribute("data-short-notice")
                                     if shortNoticeCheck == "true":
                                         shortNotice = True
                                         print("Short notice")
@@ -1147,8 +1107,8 @@ while runningLoop:
                                     time_container.click()
                                     errorPoint = "p1"
                                     time.sleep(0.1)
-                                    driver.find_element_by_id(
-                                        "slot-chosen-submit"
+                                    driver.find_element(
+                                        By.ID, "slot-chosen-submit"
                                     ).click()
                                     errorPoint = "p2"
                                     time.sleep(0.4)
@@ -1157,8 +1117,8 @@ while runningLoop:
                                             "(//button[@id='slot-warning-continue'])[2]"
                                         ).click()
                                     else:
-                                        driver.find_element_by_id(
-                                            "slot-warning-continue"
+                                        driver.find_element(
+                                            By.ID, "slot-warning-continue"
                                         ).click()
                                     errorPoint = "p3"
                                     random_sleep(1, 1)
@@ -1172,14 +1132,14 @@ while runningLoop:
                                         print("Booking attempt: " + str(attempts))
                                         try:
                                             if not iAmCandidateClicked:
-                                                driver.find_element_by_id(
-                                                    "i-am-candidate"
+                                                driver.find_element(
+                                                    By.ID, "i-am-candidate"
                                                 ).click()
                                                 iAmCandidateClicked = True
                                             try:
                                                 driver.switch_to.default_content()
-                                                iframe = driver.find_element_by_id(
-                                                    "main-iframe"
+                                                iframe = driver.find_element(
+                                                    By.ID, "main-iframe"
                                                 )
                                                 driver.switch_to.frame(iframe)
                                                 print(
@@ -1223,8 +1183,8 @@ while runningLoop:
                                                 print("Failed recaptcha")
                                             if not testTaken:
                                                 try:
-                                                    iframe = driver.find_element_by_id(
-                                                        "main-iframe"
+                                                    iframe = driver.find_element(
+                                                        By.ID, "main-iframe"
                                                     )
                                                     driver.switch_to.frame(iframe)
                                                 except:
@@ -1317,8 +1277,8 @@ while runningLoop:
                                     if test_accept:
                                         print("Booking Test...")
 
-                                        driver.find_element_by_id(
-                                            "confirm-changes"
+                                        driver.find_element(
+                                            By.ID, "confirm-changes"
                                         ).click()
                                         if (
                                             "Request unsuccessful. Incapsula incident ID"
